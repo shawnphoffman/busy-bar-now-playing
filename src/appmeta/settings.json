@@ -1,0 +1,55 @@
+{
+  "format_version": 1,
+  "version": 1,
+  "fields": {
+    "tautulli_url": {
+      "type": "string",
+      "label": "Tautulli URL",
+      "description": "Plain http on the LAN, no trailing slash.",
+      "default": "http://tautulli.lan:8181",
+      "max_length": 120
+    },
+    "api_key": {
+      "type": "string",
+      "label": "Tautulli API key",
+      "description": "Tautulli: Settings, Web Interface, API key.",
+      "default": "",
+      "max_length": 64,
+      "sensitive": true
+    },
+    "poll_seconds": {
+      "type": "integer",
+      "label": "Refresh every (seconds)",
+      "default": 15,
+      "min": 5,
+      "max": 120,
+      "step": 5
+    },
+    "dwell_seconds": {
+      "type": "integer",
+      "label": "Seconds per stream",
+      "description": "How long each stream stays on screen before the next one.",
+      "default": 8,
+      "min": 3,
+      "max": 60,
+      "step": 1
+    },
+    "transition": {
+      "type": "enum",
+      "label": "Transition",
+      "default": "slide",
+      "options": [
+        { "value": "slide", "label": "Slide" },
+        { "value": "fade", "label": "Fade" },
+        { "value": "curtain", "label": "Curtain" },
+        { "value": "cut", "label": "Cut" }
+      ]
+    },
+    "show_idle": {
+      "type": "boolean",
+      "label": "Show idle message",
+      "description": "When nothing is playing, show a dim idle line instead of a blank screen.",
+      "default": true
+    }
+  }
+}

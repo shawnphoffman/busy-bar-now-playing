@@ -1,0 +1,10 @@
+{
+  "format_version": 1,
+  "id": "app.shawnhoffman.now_playing",
+  "name": "Now Playing",
+  "version": "0.1.0",
+  "api_version": "27.14.0",
+  "description": "What is playing on Plex, via Tautulli",
+  "author": "Shawn Hoffman",
+  "heap_size_kib": 256
+}
