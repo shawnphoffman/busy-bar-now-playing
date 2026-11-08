@@ -150,6 +150,8 @@ const values = await loadValues();
 
 What it shows: line one is the title (show name for TV), line two is who is watching plus the episode, year or artist, with a one-pixel progress bar along the bottom. The bar on the left edge is coloured by media type (amber film, blue TV, green music) and its bottom cap by transcode decision (green direct play, amber direct stream, red transcode). A paused stream shows `||`. Long titles scroll, and the app never moves to the next stream until the title has scrolled through once.
 
+Launching: the app keeps the last streams it saw on the bar (in `localStorage`, rewritten only when what is playing changes, or every ten minutes otherwise) and paints them the moment it starts, then refreshes in the background, so the firmware's "Loading..." screen lasts only as long as the bar takes to start the script. A cached stream is skipped when it is over 20 minutes old (10 if paused) or its progress has run past the end. On the very first launch the empty frame (dim accent and progress track) holds the screen until Tautulli answers. If a refresh fails, the streams stay up and the left accent dims once they are more than a couple of refreshes old; retries back off up to five minutes, and the error replaces the streams only after ten minutes without an answer.
+
 Controls: turn the wheel to step through streams, press it to hold the current one, press Start to refresh now, Back to quit.
 
 ## Network note

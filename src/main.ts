@@ -1,5 +1,6 @@
 import { device } from "@shared/device";
 import { loadValues, str, num, bool } from "@shared/settings";
+import { readSnapshot, saveSnapshot, ageOf } from "@shared/cache";
 import manifest from "./appmeta/manifest.json";
 import { measure, type DisplayDrawParams } from "@busy-app/busy-lib";
 
@@ -28,6 +29,22 @@ const TRANSITION_MS = 70;
 const IDLE_POLL_SECONDS = 60;
 /** Progress bar refresh while a single stream is on screen. */
 const PROGRESS_TICK_MS = 2000;
+/** Longest Tautulli request; TLS on the bar alone can take several seconds. */
+const FETCH_TIMEOUT_MS = 20000;
+/** After failures the next try waits twice as long each time, up to this. */
+const MAX_BACKOFF_SECONDS = 300;
+/** Past this age, kept streams give way to the error: they have probably ended. */
+const ERROR_AFTER_MS = 10 * 60000;
+
+/** The launch snapshot: what was on screen last time, painted at once while a fresh fetch runs. */
+const CACHE_KEY = "np";
+/** Rewrite an unchanged snapshot this often, so its age stays honest. */
+const CACHE_HEARTBEAT_MS = 10 * 60000;
+/** Cached streams older than these are not shown at launch: a playing one has likely moved on, a paused one stopped. */
+const CACHE_PLAYING_MAX_MS = 20 * 60000;
+const CACHE_PAUSED_MAX_MS = 10 * 60000;
+/** Accent alpha while the data on screen is not live: a quiet cue in place of a spinner. */
+const STALE_ALPHA = "50";
 
 /** Accent per media type: a warm amber for films, blue for TV, green for music, grey for the rest. */
 const ACCENT: Record<string, string> = {
@@ -81,8 +98,16 @@ interface State {
   held: boolean;
   /** A transition is running; polls and ticks wait. */
   animating: boolean;
-  /** Last error from Tautulli, shown instead of streams. */
+  /** Last error from Tautulli; shown instead of streams only once they are too old to trust. */
   error: string | null;
+  /** A setup problem (no API key) that no retry will fix: shown at once. */
+  setupError: boolean;
+  /** When Tautulli last answered, from this run or the launch snapshot; 0 before any data. */
+  lastOk: number;
+  /** Consecutive failed polls, for the backoff. */
+  failures: number;
+  /** A poll is in flight; another request waits for it. */
+  polling: boolean;
   stopped: boolean;
   drawing: boolean;
   redrawWanted: boolean;
@@ -136,10 +161,24 @@ function toStream(s: Record<string, unknown>, fetchedAt: number): Stream {
   };
 }
 
+/** fetch with a time limit where the runtime supports aborting; otherwise a plain fetch. */
+async function fetchWithTimeout(url: string, init: RequestInit, ms: number): Promise<Response> {
+  if (typeof AbortController !== "function") return fetch(url, init);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function fetchStreams(settings: Settings): Promise<Stream[]> {
-  const res = await fetch(`${settings.url}/api/v2?cmd=get_activity`, {
-    headers: { Accept: "application/json", "X-Api-Key": settings.apiKey },
-  });
+  const res = await fetchWithTimeout(
+    `${settings.url}/api/v2?cmd=get_activity`,
+    { headers: { Accept: "application/json", "X-Api-Key": settings.apiKey } },
+    FETCH_TIMEOUT_MS,
+  );
   if (!res.ok) throw new Error(`Tautulli HTTP ${res.status}`);
   const body = (await res.json()) as { response?: { result?: string; message?: string; data?: { sessions?: unknown[] } } };
   const r = body.response;
@@ -196,13 +235,15 @@ function barElement(s: Stream, slot: string, dx: number, alpha: string): Element
   };
 }
 
-function streamElements(s: Stream, slot: string, dx: number, alpha: string): Element[] {
-  const accent = ACCENT[s.mediaType] ?? "#9A9A9A";
-  const title = ascii(s.title);
-  const scrolls = textWidth(title, TITLE_FONT) > TEXT_W;
-  const subtitle = ascii(s.subtitle) + (s.playing ? "" : " ||");
-  const subScrolls = textWidth(subtitle, "small") > TEXT_W;
-  const elements: Element[] = [
+/** The accent alpha: the transition's, or dimmer while the data on screen is not live. */
+function accentAlpha(alpha: string, stale: boolean): string {
+  return stale && parseInt(alpha, 16) > parseInt(STALE_ALPHA, 16) ? STALE_ALPHA : alpha;
+}
+
+/** The accent bar and its transcode cap: the only elements that change when the data goes stale or live again. */
+function capElements(s: Stream, slot: string, dx: number, alpha: string, stale: boolean): Element[] {
+  const a = accentAlpha(alpha, stale);
+  return [
     {
       id: `accent${slot}`,
       type: "rectangle",
@@ -212,7 +253,7 @@ function streamElements(s: Stream, slot: string, dx: number, alpha: string): Ele
       width: ACCENT_W,
       height: SCREEN_H - 4,
       fill: "solid",
-      fill_colors: [accent + alpha],
+      fill_colors: [(ACCENT[s.mediaType] ?? "#9A9A9A") + a],
       border_width: 0,
     },
     {
@@ -224,9 +265,20 @@ function streamElements(s: Stream, slot: string, dx: number, alpha: string): Ele
       width: ACCENT_W,
       height: 2,
       fill: "solid",
-      fill_colors: [(DECISION[s.decision] ?? "#9A9A9A") + alpha],
+      fill_colors: [(DECISION[s.decision] ?? "#9A9A9A") + a],
       border_width: 0,
     },
+  ];
+}
+
+function streamElements(s: Stream, slot: string, dx: number, alpha: string, stale: boolean): Element[] {
+  const accent = ACCENT[s.mediaType] ?? "#9A9A9A";
+  const title = ascii(s.title);
+  const scrolls = textWidth(title, TITLE_FONT) > TEXT_W;
+  const subtitle = ascii(s.subtitle) + (s.playing ? "" : " ||");
+  const subScrolls = textWidth(subtitle, "small") > TEXT_W;
+  const elements: Element[] = [
+    ...capElements(s, slot, dx, alpha, stale),
     {
       id: `title${slot}`,
       type: "text",
@@ -295,6 +347,57 @@ function messageElements(line: string, colour: string): Element[] {
   ];
 }
 
+/**
+ * The very first launch, before any data: the stream layout's empty frame (a dim accent bar and progress track),
+ * drawn at once so the app owns the screen while Tautulli answers.
+ */
+function skeletonElements(): Element[] {
+  const rect = (id: string, x: number, y: number, width: number, height: number, colour: string): Element => ({
+    id,
+    type: "rectangle",
+    x,
+    y,
+    align: "top_left",
+    width,
+    height,
+    fill: "solid",
+    fill_colors: [colour],
+    border_width: 0,
+  });
+  return [rect("skel_accent", 0, 0, ACCENT_W, SCREEN_H - 1, "#FFFFFF30"), rect("skel_track", TEXT_X, SCREEN_H - 1, TEXT_W, 1, "#FFFFFF28")];
+}
+
+/**
+ * `e` marked to expire at once. The firmware shows its "Loading..." screen whenever the app has nothing on screen,
+ * even for a moment, so the app never clears one layout before drawing the next. Instead the draw that adds the new
+ * elements also re-sends the old ones with a past `display_until` (a string, as the firmware reads it), and the
+ * firmware removes them in that same update. The element must keep its type: an update that changes an element's
+ * type is rejected outright.
+ */
+function expired(e: Element): Element {
+  return { ...e, display_until: "1" };
+}
+
+/** A transparent pixel that keeps the screen the app's while it deliberately shows nothing (idle message off). */
+const BLANK: Element = { id: "blank", type: "rectangle", x: 0, y: 0, align: "top_left", width: 1, height: 1, fill: "solid", fill_colors: ["#00000000"], border_width: 0 };
+
+/* ---------- launch snapshot ---------- */
+
+interface Cached {
+  streams: Stream[];
+  showIdle: boolean;
+}
+
+/** The streams from a snapshot still worth painting: young enough, and (when playing) not yet past their end. */
+function usableStreams(streams: Stream[], savedAt: number): Stream[] {
+  const age = ageOf(savedAt);
+  return streams.filter((s) => {
+    if (typeof s.key !== "string" || typeof s.title !== "string") return false;
+    if (!s.playing) return age < CACHE_PAUSED_MAX_MS;
+    return age < CACHE_PLAYING_MAX_MS && (s.durationMs <= 0 || progressOf(s) < 1);
+  });
+}
+
 /* ---------- app ---------- */
 
 function report(err: unknown): void {
@@ -314,6 +417,10 @@ function main(): void {
     held: false,
     animating: false,
     error: null,
+    setupError: false,
+    lastOk: 0,
+    failures: 0,
+    polling: false,
     stopped: false,
     drawing: false,
     redrawWanted: false,
@@ -322,9 +429,40 @@ function main(): void {
   let pollTimer: ReturnType<typeof setTimeout> | null = null;
   let tickTimer: ReturnType<typeof setInterval> | null = null;
   /** What is on screen now, to clear it when the layout changes. */
-  let shown: "stream" | "message" | "blank" = "blank";
+  let shown: "stream" | "message" | "skeleton" | "blank" = "blank";
   let shownSig = "";
+  let shownStale = false;
   let slotA = "a";
+
+  /** The last full layout sent, so a different layout can expire exactly these elements. */
+  let shownElements: Element[] = [];
+
+  /**
+   * Puts up `elements` as layout `next` in one draw that also expires the old layout, so the screen is never empty
+   * in between. The caller sets `shown`.
+   */
+  async function swapTo(next: typeof shown, elements: Element[]): Promise<void> {
+    const now = elements.length > 0 ? elements : [BLANK];
+    const ids = new Set(now.map((e) => e.id));
+    const old = shown !== next ? shownElements.filter((e) => !ids.has(e.id)) : [];
+    await drawElements(now.concat(old.map(expired)));
+    shownElements = now;
+  }
+
+  /**
+   * The data on screen is not live: refreshing has failed and the last good answer is older than a couple of polls.
+   * A refresh that is merely still running (at launch, say) is not stale: it lands quietly.
+   */
+  function isStale(): boolean {
+    return state.failures > 0 && state.lastOk > 0 && ageOf(state.lastOk) > Math.max(state.settings.pollSeconds * 2, 30) * 1000 + 5000;
+  }
+
+  /** The error replaces the streams only for setup problems, or once the last good data is too old to trust. */
+  function errorToShow(): string | null {
+    if (!state.error) return null;
+    if (state.setupError || state.lastOk === 0 || ageOf(state.lastOk) > ERROR_AFTER_MS) return state.error;
+    return null;
+  }
 
   async function drawElements(elements: Element[]): Promise<void> {
     await device.DisplayDraw({ application_name: APP, priority: 50, elements });
@@ -343,30 +481,39 @@ function main(): void {
     }
     state.drawing = true;
     try {
-      if (state.error) {
-        if (shown === "stream") await clearIds(idsFor(slotA));
+      const error = errorToShow();
+      if (error) {
+        await swapTo("message", messageElements(error, "#E0443EFF"));
         shown = "message";
-        await drawElements(messageElements(state.error, "#E0443EFF"));
+      } else if (state.lastOk === 0) {
+        // Nothing known yet (first launch, no snapshot): hold the screen with the empty frame.
+        if (shown !== "skeleton") {
+          await swapTo("skeleton", skeletonElements());
+          shown = "skeleton";
+        }
       } else if (state.streams.length === 0) {
-        if (shown === "stream") await clearIds(idsFor(slotA));
         if (state.settings.showIdle) {
+          await swapTo("message", messageElements("Nothing playing", DIM));
           shown = "message";
-          await drawElements(messageElements("Nothing playing", DIM));
         } else if (shown !== "blank") {
-          await clearIds(["msg"]);
+          await swapTo("blank", []);
           shown = "blank";
         }
       } else {
-        if (shown === "message") await clearIds(["msg"]);
         const s = state.streams[Math.min(state.current, state.streams.length - 1)]!;
         const sig = signature(s);
+        const stale = isStale();
         if (shown === "stream" && shownSig === sig) {
-          await drawElements([barElement(s, slotA, 0, "FF")]);
+          // Same stream: move the progress bar, and touch the accent only when the data goes stale or live again.
+          const update = [barElement(s, slotA, 0, "FF")];
+          if (stale !== shownStale) update.push(...capElements(s, slotA, 0, "FF", stale));
+          await drawElements(update);
         } else {
+          await swapTo("stream", streamElements(s, slotA, 0, "FF", stale));
           shown = "stream";
           shownSig = sig;
-          await drawElements(streamElements(s, slotA, 0, "FF"));
         }
+        shownStale = stale;
       }
     } finally {
       state.drawing = false;
@@ -384,27 +531,28 @@ function main(): void {
     const to = state.streams[next]!;
     state.animating = true;
     const slotB = slotA === "a" ? "b" : "a";
+    const stale = isStale();
     try {
       if (shown !== "stream") {
-        if (shown === "message") await clearIds(["msg"]);
-        await drawElements(streamElements(to, slotB, 0, "FF"));
+        await swapTo("stream", streamElements(to, slotB, 0, "FF", stale));
       } else if (state.settings.transition === "slide") {
         for (let i = 1; i <= TRANSITION_STEPS; i++) {
           const dx = Math.round((SCREEN_W * i) / TRANSITION_STEPS);
-          await drawElements(streamElements(from, slotA, -dx, "FF").concat(streamElements(to, slotB, SCREEN_W - dx, "FF")));
+          await drawElements(streamElements(from, slotA, -dx, "FF", stale).concat(streamElements(to, slotB, SCREEN_W - dx, "FF", stale)));
           await sleep(TRANSITION_MS);
         }
         await clearIds(idsFor(slotA));
       } else if (state.settings.transition === "fade") {
         const ramp = ["C0", "80", "40", "10"];
         for (const a of ramp) {
-          await drawElements(streamElements(from, slotA, 0, a));
+          await drawElements(streamElements(from, slotA, 0, a, stale));
           await sleep(TRANSITION_MS);
         }
-        await clearIds(idsFor(slotA));
-        for (const a of ramp.slice().reverse().concat("FF")) {
-          await drawElements(streamElements(to, slotB, 0, a));
+        // The faint first step of the next stream goes up in the same draw that expires the old one.
+        await drawElements(streamElements(to, slotB, 0, "10", stale).concat(streamElements(from, slotA, 0, "10", stale).map(expired)));
+        for (const a of ["40", "80", "C0", "FF"]) {
           await sleep(TRANSITION_MS);
+          await drawElements(streamElements(to, slotB, 0, a, stale));
         }
       } else if (state.settings.transition === "curtain") {
         const curtain = (width: number, x: number): Element => ({
@@ -425,7 +573,7 @@ function main(): void {
           await sleep(TRANSITION_MS);
         }
         await clearIds(idsFor(slotA));
-        await drawElements(streamElements(to, slotB, 0, "FF").concat(curtain(SCREEN_W, 0)));
+        await drawElements(streamElements(to, slotB, 0, "FF", stale).concat(curtain(SCREEN_W, 0)));
         for (let i = TRANSITION_STEPS - 1; i >= 0; i--) {
           const w = Math.round((SCREEN_W * i) / TRANSITION_STEPS);
           await drawElements([curtain(w, SCREEN_W - w)]);
@@ -433,12 +581,13 @@ function main(): void {
         }
         await clearIds(["curtain"]);
       } else {
-        await clearIds(idsFor(slotA));
-        await drawElements(streamElements(to, slotB, 0, "FF"));
+        await drawElements(streamElements(to, slotB, 0, "FF", stale).concat(streamElements(from, slotA, 0, "FF", stale).map(expired)));
       }
       slotA = slotB;
+      shownElements = streamElements(to, slotA, 0, "FF", stale);
       shown = "stream";
       shownSig = signature(to);
+      shownStale = stale;
       state.current = next;
       state.shownAt = Date.now();
     } finally {
@@ -446,30 +595,48 @@ function main(): void {
     }
   }
 
-  /** Fetches activity and merges it into the state without losing the stream on screen. */
+  /**
+   * Fetches activity and merges it into the state without losing the stream on screen. A failure keeps the last
+   * good streams (dimmed once stale) rather than blanking the screen, and backs off before the next try.
+   */
   async function poll(): Promise<void> {
-    if (state.stopped) return;
+    if (state.stopped || state.polling) return;
+    state.polling = true;
+    if (pollTimer !== null) clearTimeout(pollTimer);
+    pollTimer = null;
     try {
-      if (!state.settings.apiKey) throw new Error("Set the API key");
+      if (!state.settings.apiKey) {
+        state.setupError = true;
+        throw new Error("Set the API key");
+      }
       const fresh = await fetchStreams(state.settings);
       const currentKey = state.streams[state.current]?.key;
       state.streams = fresh;
       state.error = null;
+      state.lastOk = Date.now();
+      state.failures = 0;
       const keep = fresh.findIndex((s) => s.key === currentKey);
       state.current = keep >= 0 ? keep : 0;
+      const content = fresh.map(signature).join("\n") + `|${state.settings.showIdle}`;
+      saveSnapshot<Cached>(CACHE_KEY, { streams: fresh, showIdle: state.settings.showIdle }, content, CACHE_HEARTBEAT_MS);
     } catch (err) {
       state.error = err instanceof Error ? err.message : String(err);
-      state.streams = [];
+      state.failures++;
+      report(err);
+    } finally {
+      state.polling = false;
     }
     await draw();
     schedulePoll();
   }
 
-  function schedulePoll(): void {
+  function schedulePoll(delayMs?: number): void {
     if (state.stopped) return;
     if (pollTimer !== null) clearTimeout(pollTimer);
-    const seconds = state.streams.length === 0 && !state.error ? Math.max(state.settings.pollSeconds, IDLE_POLL_SECONDS) : state.settings.pollSeconds;
-    pollTimer = setTimeout(() => void poll().catch(report), seconds * 1000);
+    const s = state.settings;
+    let seconds = state.streams.length === 0 ? Math.max(s.pollSeconds, IDLE_POLL_SECONDS) : s.pollSeconds;
+    if (state.failures > 0) seconds = Math.min(MAX_BACKOFF_SECONDS, s.pollSeconds * Math.pow(2, state.failures));
+    pollTimer = setTimeout(() => void poll().catch(report), delayMs ?? seconds * 1000);
   }
 
   /** Advances the progress bar and, on the dwell timer, moves to the next stream. */
@@ -515,6 +682,19 @@ function main(): void {
     }
   });
 
+  // Paint the last known state at once, so the firmware's loading screen gives way immediately; a fresh fetch follows.
+  const snap = readSnapshot<Cached>(CACHE_KEY);
+  if (snap && Array.isArray(snap.data.streams) && ageOf(snap.savedAt) < CACHE_PLAYING_MAX_MS) {
+    const usable = usableStreams(snap.data.streams, snap.savedAt);
+    // If every cached stream aged out, nothing about the present is known: show the empty frame, not "Nothing playing".
+    if (usable.length > 0 || snap.data.streams.length === 0) {
+      state.streams = usable;
+      state.lastOk = snap.savedAt;
+    }
+    state.settings.showIdle = snap.data.showIdle !== false;
+  }
+  void draw().catch(report);
+
   void loadValues(APP)
     .then((values) => {
       const s = state.settings;
@@ -529,7 +709,12 @@ function main(): void {
     .catch(report)
     .then(() => {
       tickTimer = setInterval(tick, PROGRESS_TICK_MS);
-      void poll().catch(report);
+      // A snapshot younger than one poll interval is as good as a fetch: wait out the rest of the interval.
+      const wait = state.lastOk > 0 ? state.settings.pollSeconds * 1000 - ageOf(state.lastOk) : 0;
+      if (wait > 0) schedulePoll(wait);
+      else void poll().catch(report);
+      // The idle message may have been drawn from the snapshot's setting; redraw in case it changed.
+      void draw().catch(report);
     });
 }
 
