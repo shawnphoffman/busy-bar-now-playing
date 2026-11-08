@@ -27,8 +27,8 @@ const TRANSITION_STEPS = 6;
 const TRANSITION_MS = 70;
 /** Poll interval while nothing is playing. */
 const IDLE_POLL_SECONDS = 60;
-/** Progress bar refresh while a single stream is on screen. */
-const PROGRESS_TICK_MS = 2000;
+/** How often the dwell timer and the stale cue are checked. */
+const TICK_MS = 2000;
 /** Longest Tautulli request; TLS on the bar alone can take several seconds. */
 const FETCH_TIMEOUT_MS = 20000;
 /** After failures the next try waits twice as long each time, up to this. */
@@ -58,7 +58,6 @@ const ACCENT: Record<string, string> = {
   photo: "#B07CE8",
 };
 const DIM = "#FFFFFF70";
-const PAUSED = "#FFFFFF50";
 /** Transcode decision colours for the accent bar's lower cap. */
 const DECISION: Record<string, string> = {
   "direct play": "#3DD68C",
@@ -137,7 +136,7 @@ function toStream(s: Record<string, unknown>, fetchedAt: number): Stream {
   const title = text(s.title);
   const year = text(s.year);
   const user = text(s.friendly_name) || text(s.user);
-  // Line one is what is playing; line two is who is watching it, then the episode, year or artist.
+  // Line one is what is playing (a film with its year); line two is who is watching, then the episode or artist.
   let line1 = title;
   let detail = "";
   if (mediaType === "episode") {
@@ -146,7 +145,7 @@ function toStream(s: Record<string, unknown>, fetchedAt: number): Stream {
     const episode = integer(s.media_index);
     detail = season || episode ? `S${season}E${episode}` : "";
   } else if (mediaType === "movie") {
-    detail = year;
+    line1 = year ? `${title} (${year})` : title;
   } else if (mediaType === "track") {
     detail = grandparent || parent;
   }
@@ -219,27 +218,6 @@ function ascii(t: string): string {
   return out;
 }
 
-/**
- * The elements of one stream, offset by `dx` pixels (for sliding) with the given text alpha (for fading).
- * Ids carry a slot suffix so two streams can be on screen during a transition.
- */
-function barElement(s: Stream, slot: string, dx: number, alpha: string): Element {
-  const accent = ACCENT[s.mediaType] ?? "#9A9A9A";
-  return {
-    id: `bar${slot}`,
-    type: "rectangle",
-    x: TEXT_X + dx,
-    y: SCREEN_H - 1,
-    align: "top_left",
-    width: Math.max(1, Math.round(TEXT_W * progressOf(s))),
-    height: 1,
-    fill: "solid",
-    fill_colors: [s.playing ? accent + alpha : PAUSED],
-    border_width: 0,
-    z_index: 1,
-  };
-}
-
 /** The accent alpha: the transition's, or dimmer while the data on screen is not live. */
 function accentAlpha(alpha: string, stale: boolean): string {
   return stale && parseInt(alpha, 16) > parseInt(STALE_ALPHA, 16) ? STALE_ALPHA : alpha;
@@ -256,7 +234,7 @@ function capElements(s: Stream, slot: string, dx: number, alpha: string, stale: 
       y: 0,
       align: "top_left",
       width: ACCENT_W,
-      height: SCREEN_H - 4,
+      height: SCREEN_H - 3,
       fill: "solid",
       fill_colors: [(ACCENT[s.mediaType] ?? "#9A9A9A") + a],
       border_width: 0,
@@ -265,7 +243,7 @@ function capElements(s: Stream, slot: string, dx: number, alpha: string, stale: 
       id: `decision${slot}`,
       type: "rectangle",
       x: dx,
-      y: SCREEN_H - 3,
+      y: SCREEN_H - 2,
       align: "top_left",
       width: ACCENT_W,
       height: 2,
@@ -276,6 +254,19 @@ function capElements(s: Stream, slot: string, dx: number, alpha: string, stale: 
   ];
 }
 
+/**
+ * Text rows. The condensed title font keeps two empty rows above its capitals, so a title set at y = -1 puts its
+ * capitals on rows 1-7 and its descenders on rows 8-9. The small second line, set at y = 9, puts its capitals on the
+ * bottom rows 11-15; its descenders (g, p, y) fall below the screen and are clipped, a deliberate trade so the
+ * line sits flush with the bottom. Row 10 stays clear between the two lines.
+ */
+const TITLE_Y = -1;
+const SUB_Y = 9;
+
+/**
+ * The elements of one stream, offset by `dx` pixels (for sliding) with the given text alpha (for fading).
+ * Ids carry a slot suffix so two streams can be on screen during a transition.
+ */
 function streamElements(s: Stream, slot: string, dx: number, alpha: string, stale: boolean): Element[] {
   const accent = ACCENT[s.mediaType] ?? "#9A9A9A";
   const title = ascii(s.title);
@@ -288,7 +279,7 @@ function streamElements(s: Stream, slot: string, dx: number, alpha: string, stal
       id: `title${slot}`,
       type: "text",
       x: TEXT_X + dx,
-      y: 0,
+      y: TITLE_Y,
       align: "top_left",
       text: title,
       font: TITLE_FONT,
@@ -300,7 +291,7 @@ function streamElements(s: Stream, slot: string, dx: number, alpha: string, stal
       id: `sub${slot}`,
       type: "text",
       x: TEXT_X + dx,
-      y: 7,
+      y: SUB_Y,
       align: "top_left",
       text: subtitle,
       font: "small",
@@ -308,19 +299,6 @@ function streamElements(s: Stream, slot: string, dx: number, alpha: string, stal
       width: TEXT_W,
       ...(subScrolls ? { scroll_rate: SCROLL_RATE, scroll_start_delay: SCROLL_START_MS + 1000, scroll_repeat_delay: SCROLL_REPEAT_MS } : {}),
     },
-    {
-      id: `track${slot}`,
-      type: "rectangle",
-      x: TEXT_X + dx,
-      y: SCREEN_H - 1,
-      align: "top_left",
-      width: TEXT_W,
-      height: 1,
-      fill: "solid",
-      fill_colors: ["#FFFFFF28"],
-      border_width: 0,
-    },
-    barElement(s, slot, dx, alpha),
   ];
   return elements;
 }
@@ -335,12 +313,12 @@ function scrollTimeMs(s: Stream): number {
   return SCROLL_START_MS + 1000 + (overflow / (SCROLL_RATE / 60)) * 1000 + 1500;
 }
 
-/** What a full redraw depends on; while it is unchanged only the progress bar is resent, so scrolling titles keep their place. */
+/** What a full redraw depends on; while it is unchanged nothing is resent, so scrolling titles keep their place. */
 function signature(s: Stream): string {
   return `${s.key}|${s.title}|${s.subtitle}|${s.playing}|${s.decision}`;
 }
 
-const STREAM_IDS = ["accent", "decision", "title", "sub", "track", "bar"];
+const STREAM_IDS = ["accent", "decision", "title", "sub"];
 
 function idsFor(slot: string): string[] {
   return STREAM_IDS.map((id) => id + slot);
@@ -377,7 +355,7 @@ function friendly(err: unknown): string {
 }
 
 /**
- * The very first launch, before any data: the stream layout's empty frame (a dim accent bar and progress track),
+ * The very first launch, before any data: the stream layout's empty frame (a dim accent bar),
  * drawn at once so the app owns the screen while Tautulli answers.
  */
 function skeletonElements(): Element[] {
@@ -393,7 +371,7 @@ function skeletonElements(): Element[] {
     fill_colors: [colour],
     border_width: 0,
   });
-  return [rect("skel_accent", 0, 0, ACCENT_W, SCREEN_H - 1, "#FFFFFF30"), rect("skel_track", TEXT_X, SCREEN_H - 1, TEXT_W, 1, "#FFFFFF28")];
+  return [rect("skel_accent", 0, 0, ACCENT_W, SCREEN_H, "#FFFFFF30")];
 }
 
 /**
@@ -516,7 +494,7 @@ function main(): void {
     await device.DisplayClear({ application_name: APP, element_ids: ids });
   }
 
-  /** Redraws the current stream in place (progress, pause state), coalescing concurrent requests. */
+  /** Redraws the current stream in place (pause state, stale cue), coalescing concurrent requests. */
   async function draw(): Promise<void> {
     if (state.stopped || state.animating) return;
     if (state.drawing) {
@@ -548,10 +526,8 @@ function main(): void {
         const sig = signature(s);
         const stale = isStale();
         if (shown === "stream" && shownSig === sig) {
-          // Same stream: move the progress bar, and touch the accent only when the data goes stale or live again.
-          const update = [barElement(s, slotA, 0, "FF")];
-          if (stale !== shownStale) update.push(...capElements(s, slotA, 0, "FF", stale));
-          await drawElements(update);
+          // Same stream: only the accent changes, when the data goes stale or live again.
+          if (stale !== shownStale) await drawElements(capElements(s, slotA, 0, "FF", stale));
         } else {
           await swapTo("stream", streamElements(s, slotA, 0, "FF", stale));
           shown = "stream";
@@ -693,7 +669,7 @@ function main(): void {
     pollTimer = setTimeout(() => void poll().catch(report), delayMs ?? seconds * 1000);
   }
 
-  /** Advances the progress bar and, on the dwell timer, moves to the next stream. */
+  /** Keeps the stale cue current and, on the dwell timer, moves to the next stream. */
   function tick(): void {
     if (state.stopped || state.animating || state.streams.length === 0) return;
     const many = state.streams.length > 1;
@@ -762,7 +738,7 @@ function main(): void {
     })
     .catch(report)
     .then(() => {
-      tickTimer = setInterval(tick, PROGRESS_TICK_MS);
+      tickTimer = setInterval(tick, TICK_MS);
       // A snapshot younger than one poll interval is as good as a fetch: wait out the rest of the interval.
       const wait = state.lastOk > 0 ? state.settings.pollSeconds * 1000 - ageOf(state.lastOk) : 0;
       if (wait > 0) schedulePoll(wait);
