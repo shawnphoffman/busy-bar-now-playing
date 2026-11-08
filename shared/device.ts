@@ -13,6 +13,7 @@ import type {
   DisplayClearParams,
   DisplayDrawParams,
   SuccessResponse,
+  WifiStatusResponse,
 } from "@busy-app/busy-lib";
 
 const BASE = `http://${__BUSY_ADDR__}/api`;
@@ -35,4 +36,5 @@ export const device = {
     call<AppSettingsDocument>("GET", `/apps/settings?app_id=${encodeURIComponent(params.app_id)}`),
   AudioPlay: (params: AudioPlayParams) => call<SuccessResponse>("POST", "/audio/play", params),
   BusySnapshotGet: () => call<BusySnapshot>("GET", "/busy/snapshot"),
+  WifiStatusGet: () => call<WifiStatusResponse>("GET", "/wifi/status"),
 };

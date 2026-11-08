@@ -43,6 +43,9 @@ const CACHE_HEARTBEAT_MS = 10 * 60000;
 /** Cached streams older than these are not shown at launch: a playing one has likely moved on, a paused one stopped. */
 const CACHE_PLAYING_MAX_MS = 20 * 60000;
 const CACHE_PAUSED_MAX_MS = 10 * 60000;
+/** While the bar is off Wi-Fi, how often to look again; Tautulli is not tried until it is back. */
+const WIFI_CHECK_MS = 15000;
+
 /** Accent alpha while the data on screen is not live: a quiet cue in place of a spinner. */
 const STALE_ALPHA = "50";
 
@@ -108,6 +111,8 @@ interface State {
   failures: number;
   /** A poll is in flight; another request waits for it. */
   polling: boolean;
+  /** The bar reported it is not on Wi-Fi after a failed refresh; polls only re-check Wi-Fi until it is back. */
+  offline: boolean;
   stopped: boolean;
   drawing: boolean;
   redrawWanted: boolean;
@@ -341,10 +346,34 @@ function idsFor(slot: string): string[] {
   return STREAM_IDS.map((id) => id + slot);
 }
 
+/** One centred line; scrolls in place if it is ever wider than the screen. */
 function messageElements(line: string, colour: string): Element[] {
+  const scrolls = textWidth(line, "small") > SCREEN_W - 2;
   return [
-    { id: "msg", type: "text", x: SCREEN_W / 2, y: SCREEN_H / 2, align: "center", text: line, font: "small", color: colour },
+    {
+      id: "msg",
+      type: "text",
+      x: SCREEN_W / 2,
+      y: SCREEN_H / 2,
+      align: "center",
+      text: line,
+      font: "small",
+      color: colour,
+      ...(scrolls ? { width: SCREEN_W - 2, scroll_rate: SCROLL_RATE, scroll_start_delay: SCROLL_START_MS, scroll_repeat_delay: SCROLL_REPEAT_MS } : {}),
+    },
   ];
+}
+
+/**
+ * A failed refresh in words that fit the screen. Network failures surface from the runtime as codes such as
+ * "connect 113" or "socket error"; those say nothing useful on a 72-pixel display, so they read as one message.
+ * The raw error still goes to the log.
+ */
+function friendly(err: unknown): string {
+  const m = err instanceof Error ? err.message : String(err);
+  if (/api ?key|HTTP 401|HTTP 403/i.test(m)) return m === "Set the API key" ? m : "Check API key";
+  if (m.startsWith("Tautulli")) return m;
+  return "Tautulli offline";
 }
 
 /**
@@ -417,6 +446,7 @@ function main(): void {
     held: false,
     animating: false,
     error: null,
+    offline: false,
     setupError: false,
     lastOk: 0,
     failures: 0,
@@ -457,11 +487,25 @@ function main(): void {
     return state.failures > 0 && state.lastOk > 0 && ageOf(state.lastOk) > Math.max(state.settings.pollSeconds * 2, 30) * 1000 + 5000;
   }
 
-  /** The error replaces the streams only for setup problems, or once the last good data is too old to trust. */
-  function errorToShow(): string | null {
-    if (!state.error) return null;
-    if (state.setupError || state.lastOk === 0 || ageOf(state.lastOk) > ERROR_AFTER_MS) return state.error;
+  /**
+   * The message that replaces the streams: only for setup problems, or once the last good data is too old to trust.
+   * Being off Wi-Fi is the bar's state, not a Tautulli fault, so it reads calmly rather than in red.
+   */
+  function messageToShow(): { text: string; colour: string } | null {
+    if (!state.error && !state.offline) return null;
+    const tooOld = state.lastOk === 0 || ageOf(state.lastOk) > ERROR_AFTER_MS;
+    if (state.offline) return tooOld ? { text: "No Wi-Fi", colour: DIM } : null;
+    if (state.setupError || tooOld) return { text: state.error!, colour: "#E0443EFF" };
     return null;
+  }
+
+  /** Whether the bar is on Wi-Fi; null when it cannot say, which is treated as online. */
+  async function wifiConnected(): Promise<boolean | null> {
+    try {
+      return (await device.WifiStatusGet()).state === "connected";
+    } catch {
+      return null;
+    }
   }
 
   async function drawElements(elements: Element[]): Promise<void> {
@@ -481,9 +525,9 @@ function main(): void {
     }
     state.drawing = true;
     try {
-      const error = errorToShow();
-      if (error) {
-        await swapTo("message", messageElements(error, "#E0443EFF"));
+      const message = messageToShow();
+      if (message) {
+        await swapTo("message", messageElements(message.text, message.colour));
         shown = "message";
       } else if (state.lastOk === 0) {
         // Nothing known yet (first launch, no snapshot): hold the screen with the empty frame.
@@ -604,6 +648,14 @@ function main(): void {
     state.polling = true;
     if (pollTimer !== null) clearTimeout(pollTimer);
     pollTimer = null;
+    // Off Wi-Fi, Tautulli cannot answer: check the bar's own connection (a cheap local call) and wait for it.
+    if (state.offline && (await wifiConnected()) === false) {
+      state.polling = false;
+      await draw();
+      schedulePoll(WIFI_CHECK_MS);
+      return;
+    }
+    state.offline = false;
     try {
       if (!state.settings.apiKey) {
         state.setupError = true;
@@ -620,14 +672,16 @@ function main(): void {
       const content = fresh.map(signature).join("\n") + `|${state.settings.showIdle}`;
       saveSnapshot<Cached>(CACHE_KEY, { streams: fresh, showIdle: state.settings.showIdle }, content, CACHE_HEARTBEAT_MS);
     } catch (err) {
-      state.error = err instanceof Error ? err.message : String(err);
+      state.error = friendly(err);
       state.failures++;
       report(err);
+      // Ask the bar whether it is on Wi-Fi only after a failure, so a healthy poll costs one request.
+      if (!state.setupError && (await wifiConnected()) === false) state.offline = true;
     } finally {
       state.polling = false;
     }
     await draw();
-    schedulePoll();
+    schedulePoll(state.offline ? WIFI_CHECK_MS : undefined);
   }
 
   function schedulePoll(delayMs?: number): void {
