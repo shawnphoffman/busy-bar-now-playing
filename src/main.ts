@@ -16,15 +16,26 @@ const ACCENT_W = 2;
 /** Where the text columns start. */
 const TEXT_X = ACCENT_W + 2;
 const TEXT_W = SCREEN_W - TEXT_X;
-/** Scrolling for titles wider than the screen, in pixels per minute (10 px/s), and the pauses around a pass. */
-const SCROLL_RATE = 600;
+/**
+ * Scrolling for titles wider than the screen, in pixels per minute (25 px/s), and the pauses around a pass.
+ * The panel redraws about 25 times a second and text moves in whole pixels, so 1500 is the fastest rate that still
+ * steps one pixel per refresh (measured: 96% single-pixel steps, about 40 ms apart). Slower rates step visibly
+ * (600 moved a pixel every ~115 ms); faster ones start skipping 2-3 pixels at a time.
+ */
+const SCROLL_RATE = 1500;
 const SCROLL_START_MS = 1500;
 const SCROLL_REPEAT_MS = 3000;
 /** The title font: condensed fits a few more characters before a title has to scroll. */
 const TITLE_FONT = "condensed";
-/** Frames in a transition, and the pause between them. */
-const TRANSITION_STEPS = 6;
-const TRANSITION_MS = 70;
+/**
+ * Transition timing. Frames are placed by elapsed time, not counted, so an uneven draw delays one frame instead of
+ * stretching the whole animation. A draw from the app takes about 40-55 ms on the bar, which already paces frames
+ * near the panel's ~25 Hz refresh; FRAME_MIN_MS keeps a fast draw from sending frames the panel would never show.
+ */
+const SLIDE_MS = 650;
+/** Each half of a fade or curtain: out, then in. */
+const PHASE_MS = 450;
+const FRAME_MIN_MS = 40;
 /** Poll interval while nothing is playing. */
 const IDLE_POLL_SECONDS = 60;
 /** How often the dwell timer and the stale cue are checked. */
@@ -385,6 +396,11 @@ function expired(e: Element): Element {
   return { ...e, display_until: "1" };
 }
 
+/** `elements` moved `dx` pixels sideways. */
+function shifted(elements: Element[], dx: number): Element[] {
+  return elements.map((e) => ({ ...e, x: (e.x ?? 0) + dx }));
+}
+
 /** A transparent pixel that keeps the screen the app's while it deliberately shows nothing (idle message off). */
 const BLANK: Element = { id: "blank", type: "rectangle", x: 0, y: 0, align: "top_left", width: 1, height: 1, fill: "solid", fill_colors: ["#00000000"], border_width: 0 };
 
@@ -413,6 +429,34 @@ function report(err: unknown): void {
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Slow at both ends, so the big per-frame jumps fall mid-move where the eye tracks them least. */
+function easeInOut(p: number): number {
+  return p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2;
+}
+
+/** Two hex digits of alpha for 0-255. */
+function alphaHex(a: number): string {
+  const n = Math.max(0, Math.min(255, Math.round(a)));
+  return (n < 16 ? "0" : "") + n.toString(16).toUpperCase();
+}
+
+/**
+ * Calls `frame` with progress from just above 0 up to exactly 1 over `ms`. Each frame aims at where the motion
+ * should be when it lands (one frame ahead), the draws themselves pace the loop, and there is never more than one
+ * draw in flight.
+ */
+async function animate(ms: number, frame: (p: number) => Promise<void>): Promise<void> {
+  const start = Date.now();
+  for (;;) {
+    const t = Date.now();
+    const p = Math.min(1, (t - start + FRAME_MIN_MS) / ms);
+    await frame(p);
+    if (p >= 1) return;
+    const wait = FRAME_MIN_MS - (Date.now() - t);
+    if (wait > 0) await sleep(wait);
+  }
 }
 
 function main(): void {
@@ -556,24 +600,25 @@ function main(): void {
       if (shown !== "stream") {
         await swapTo("stream", streamElements(to, slotB, 0, "FF", stale));
       } else if (state.settings.transition === "slide") {
-        for (let i = 1; i <= TRANSITION_STEPS; i++) {
-          const dx = Math.round((SCREEN_W * i) / TRANSITION_STEPS);
-          await drawElements(streamElements(from, slotA, -dx, "FF", stale).concat(streamElements(to, slotB, SCREEN_W - dx, "FF", stale)));
-          await sleep(TRANSITION_MS);
-        }
+        // Both layouts are built once and only shifted per frame: building one measures its text widths, which on
+        // the bar's runtime took about as long as the draw itself and halved the frame rate.
+        const fromEls = streamElements(from, slotA, 0, "FF", stale);
+        const toEls = streamElements(to, slotB, 0, "FF", stale);
+        let lastDx = 0;
+        await animate(SLIDE_MS, async (p) => {
+          const dx = Math.round(SCREEN_W * easeInOut(p));
+          if (dx === lastDx && p < 1) return;
+          lastDx = dx;
+          await drawElements(shifted(fromEls, -dx).concat(shifted(toEls, SCREEN_W - dx)));
+        });
         await clearIds(idsFor(slotA));
       } else if (state.settings.transition === "fade") {
-        const ramp = ["C0", "80", "40", "10"];
-        for (const a of ramp) {
-          await drawElements(streamElements(from, slotA, 0, a, stale));
-          await sleep(TRANSITION_MS);
-        }
-        // The faint first step of the next stream goes up in the same draw that expires the old one.
-        await drawElements(streamElements(to, slotB, 0, "10", stale).concat(streamElements(from, slotA, 0, "10", stale).map(expired)));
-        for (const a of ["40", "80", "C0", "FF"]) {
-          await sleep(TRANSITION_MS);
-          await drawElements(streamElements(to, slotB, 0, a, stale));
-        }
+        // Down to a faint 0x10, never fully off, then the faint first step of the next stream goes up in the same
+        // draw that expires the old one.
+        const FAINT = 0x10;
+        await animate(PHASE_MS, (p) => drawElements(streamElements(from, slotA, 0, alphaHex(255 - (255 - FAINT) * p), stale)));
+        await drawElements(streamElements(to, slotB, 0, alphaHex(FAINT), stale).concat(streamElements(from, slotA, 0, alphaHex(FAINT), stale).map(expired)));
+        await animate(PHASE_MS, (p) => drawElements(streamElements(to, slotB, 0, alphaHex(FAINT + (255 - FAINT) * p), stale)));
       } else if (state.settings.transition === "curtain") {
         const curtain = (width: number, x: number): Element => ({
           id: "curtain",
@@ -588,17 +633,13 @@ function main(): void {
           border_width: 0,
           z_index: 20,
         });
-        for (let i = 1; i <= TRANSITION_STEPS; i++) {
-          await drawElements([curtain(Math.round((SCREEN_W * i) / TRANSITION_STEPS), 0)]);
-          await sleep(TRANSITION_MS);
-        }
+        await animate(PHASE_MS, (p) => drawElements([curtain(Math.round(SCREEN_W * easeInOut(p)), 0)]));
         await clearIds(idsFor(slotA));
         await drawElements(streamElements(to, slotB, 0, "FF", stale).concat(curtain(SCREEN_W, 0)));
-        for (let i = TRANSITION_STEPS - 1; i >= 0; i--) {
-          const w = Math.round((SCREEN_W * i) / TRANSITION_STEPS);
-          await drawElements([curtain(w, SCREEN_W - w)]);
-          await sleep(TRANSITION_MS);
-        }
+        await animate(PHASE_MS, (p) => {
+          const w = Math.round(SCREEN_W * (1 - easeInOut(p)));
+          return drawElements([curtain(w, SCREEN_W - w)]);
+        });
         await clearIds(["curtain"]);
       } else {
         await drawElements(streamElements(to, slotB, 0, "FF", stale).concat(streamElements(from, slotA, 0, "FF", stale).map(expired)));
